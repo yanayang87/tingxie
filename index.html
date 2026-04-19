@@ -379,55 +379,38 @@ function ttsUrl(text, lang) {
 
 // 播放一段语音，返回 Promise
 // myId 用来检测是否被取消
+// 只用有道在线发音，失败自动重试一次，绝不降级到系统语音
 function playAudio(text, lang, myId) {
   return new Promise(function(resolve) {
     if (myId !== cancelId) { resolve(); return; }
 
-    var audio = new Audio(ttsUrl(text, lang));
+    function tryPlay(retryLeft) {
+      if (myId !== cancelId) { resolve(); return; }
+      var audio = new Audio(ttsUrl(text, lang));
+      audio.playbackRate = 0.85;
+      window._activeAudio = audio;
 
-    audio.onended = function() { resolve(); };
-    audio.onerror = function() {
-      // 降级到系统语音
-      playSystemVoice(text, lang, myId).then(resolve);
-    };
-
-    audio.play().then(function() {
-      // 播放成功
-    }).catch(function() {
-      // 自动播放被阻止或其他错误，降级
-      playSystemVoice(text, lang, myId).then(resolve);
-    });
-
-    // 保存引用以便停止
-    window._activeAudio = audio;
-  });
-}
-
-function playSystemVoice(text, lang, myId) {
-  return new Promise(function(resolve) {
-    if (myId !== cancelId) { resolve(); return; }
-    if (!window.speechSynthesis) { resolve(); return; }
-
-    speechSynthesis.cancel();
-    var u = new SpeechSynthesisUtterance(text);
-    u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
-    u.rate = 0.8;
-
-    // 尝试找对应语言的声音
-    try {
-      var voices = speechSynthesis.getVoices();
-      var target = (lang === 'zh') ? 'zh-CN' : 'en';
-      for (var i = 0; i < voices.length; i++) {
-        if (voices[i].lang.replace('_','-') === target || voices[i].lang.indexOf(target) === 0) {
-          u.voice = voices[i];
-          break;
+      audio.onended = function() { resolve(); };
+      audio.onerror = function() {
+        if (retryLeft > 0) {
+          setTimeout(function() { tryPlay(retryLeft - 1); }, 300);
+        } else {
+          resolve();
         }
-      }
-    } catch(e) {}
+      };
 
-    u.onend = function() { resolve(); };
-    u.onerror = function() { resolve(); };
-    speechSynthesis.speak(u);
+      audio.play().then(function() {
+        // 播放成功
+      }).catch(function() {
+        if (retryLeft > 0) {
+          setTimeout(function() { tryPlay(retryLeft - 1); }, 300);
+        } else {
+          resolve();
+        }
+      });
+    }
+
+    tryPlay(2);
   });
 }
 
@@ -437,6 +420,7 @@ function quickSpeak(text, lang) {
     if (window._peekAudio) window._peekAudio.pause();
   } catch(e) {}
   var a = new Audio(ttsUrl(text, lang));
+  a.playbackRate = 0.85;
   window._peekAudio = a;
   a.play().catch(function() {});
 }
@@ -458,7 +442,6 @@ function stopAll() {
   running = false;
   clearTimeout(delayTimer);
   try { window._activeAudio && window._activeAudio.pause(); } catch(e) {}
-  try { window.speechSynthesis && speechSynthesis.cancel(); } catch(e) {}
 }
 
 // ==========================================
