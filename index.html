@@ -371,32 +371,37 @@ function getPinyin(word) {
 }
 
 // ==========================================
-//  语音系统（自动检测最佳方案）
-//  首次播放尝试在线TTS，成功就一直用在线
-//  失败则永久切换系统语音（严格zh-CN，不会粤语）
-//  绝不交替使用，避免两种声音
+//  语音系统：纯系统语音（最稳定）
+//  严格只用 zh-CN 普通话，排除一切粤语/台语
+//  不走网络，不会时好时坏
 // ==========================================
-var useSysVoice = false;   // 一旦为true，本次听写全用系统语音
-var zhVoice = null;        // 最佳中文系统语音
-var enVoice = null;        // 最佳英文系统语音
+var zhVoice = null;
+var enVoice = null;
 
-// 查找系统语音（页面加载时）
 function initVoices() {
   if (!window.speechSynthesis) return;
   var voices = speechSynthesis.getVoices();
+  var zhList = [], enList = [];
+
   for (var i = 0; i < voices.length; i++) {
     var v = voices[i];
     var lang = v.lang.replace('_', '-');
-    // 严格排除粤语、台语
-    if (/zh-HK|zh-TW|yue|Cantonese|zh-SG/i.test(lang + ' ' + v.name)) continue;
-    if (lang === 'zh-CN') {
-      if (!zhVoice) zhVoice = v;
-      if (/Microsoft|Google|Huihui|Xiaoxiao|Kangkang/i.test(v.name)) zhVoice = v;
+    // 只要 zh-CN，排除一切粤语台语
+    if (lang === 'zh-CN' && !/Cantonese|HK|TW|粤|廣|台/i.test(v.name)) {
+      zhList.push(v);
     }
-    if (lang === 'en-US' || lang === 'en-GB') {
-      if (!enVoice) enVoice = v;
-      if (/Microsoft|Google/i.test(v.name)) enVoice = v;
-    }
+    if (lang === 'en-US') enList.push(v);
+    if (lang === 'en-GB' && enList.length === 0) enList.push(v);
+  }
+
+  // 优先微软/Google高品质语音
+  zhVoice = zhList[0] || null;
+  for (var i = 0; i < zhList.length; i++) {
+    if (/Microsoft|Google|Huihui|Xiaoxiao|Kangkang/i.test(zhList[i].name)) { zhVoice = zhList[i]; break; }
+  }
+  enVoice = enList[0] || null;
+  for (var i = 0; i < enList.length; i++) {
+    if (/Microsoft|Google/i.test(enList[i].name)) { enVoice = enList[i]; break; }
   }
 }
 if (window.speechSynthesis) {
@@ -404,95 +409,44 @@ if (window.speechSynthesis) {
   initVoices();
 }
 
-// 在线TTS地址
-function ttsUrl(text, lang) {
-  return 'https://dict.youdao.com/dictvoice?audio=' + encodeURIComponent(text) + '&le=' + (lang === 'zh' ? 'zh' : 'en');
-}
-
-// 尝试在线播放，返回 Promise<boolean>（是否成功）
-function tryOnline(text, lang) {
+// 播放一段语音，返回 Promise
+function playAudio(text, lang, myId) {
   return new Promise(function(resolve) {
-    var a = new Audio(ttsUrl(text, lang));
-    var settled = false;
-    window._activeAudio = a;
-
-    function ok()   { if (!settled) { settled = true; resolve(true); } }
-    function fail() { if (!settled) { settled = true; resolve(false); } }
-
-    a.onended = ok;
-    a.onerror = fail;
-    setTimeout(fail, 5000);
-
-    var p = a.play();
-    if (p && p.catch) p.catch(fail);
-  });
-}
-
-// 系统语音播放
-function playSys(text, lang) {
-  return new Promise(function(resolve) {
+    if (myId !== cancelId) { resolve(); return; }
     if (!window.speechSynthesis) { resolve(); return; }
+
     speechSynthesis.cancel();
+
     var u = new SpeechSynthesisUtterance(text);
     u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
-    u.rate = 0.85;
+    u.rate = 0.8;
+    u.volume = 1;
+
     var voice = (lang === 'zh') ? zhVoice : enVoice;
     if (voice) u.voice = voice;
+
     var done = false;
     function finish() { if (!done) { done = true; resolve(); } }
+
     u.onend = finish;
     u.onerror = finish;
     setTimeout(finish, 8000);
+
     speechSynthesis.speak(u);
   });
 }
 
-// 主播放函数
-function playAudio(text, lang, myId) {
-  return new Promise(function(resolve) {
-    if (myId !== cancelId) { resolve(); return; }
-
-    // 已确定用系统语音
-    if (useSysVoice) {
-      playSys(text, lang).then(resolve);
-      return;
-    }
-
-    // 尝试在线
-    tryOnline(text, lang).then(function(success) {
-      if (myId !== cancelId) { resolve(); return; }
-      if (success) {
-        resolve();
-      } else {
-        // 在线失败 → 永久切到系统语音
-        useSysVoice = true;
-        playSys(text, lang).then(resolve);
-      }
-    });
-  });
-}
-
-// 快速播放（看一看按钮）
+// 快速播放（看一看按钮用）
 function quickSpeak(text, lang) {
-  try { if (window._peekAudio) window._peekAudio.pause(); } catch(e) {}
-  try { window.speechSynthesis && speechSynthesis.cancel(); } catch(e) {}
-
-  if (useSysVoice) {
-    if (window.speechSynthesis) {
-      var u = new SpeechSynthesisUtterance(text);
-      u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
-      u.rate = 0.85;
-      var voice = (lang === 'zh') ? zhVoice : enVoice;
-      if (voice) u.voice = voice;
-      speechSynthesis.speak(u);
-    }
-    return;
-  }
-
-  var a = new Audio(ttsUrl(text, lang));
-  window._peekAudio = a;
-  var p = a.play();
-  if (p && p.catch) p.catch(function() {});
+  if (!window.speechSynthesis) return;
+  speechSynthesis.cancel();
+  var u = new SpeechSynthesisUtterance(text);
+  u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
+  u.rate = 0.8;
+  u.volume = 1;
+  var voice = (lang === 'zh') ? zhVoice : enVoice;
+  if (voice) u.voice = voice;
+  speechSynthesis.speak(u);
 }
 
 // ==========================================
@@ -511,8 +465,7 @@ function stopAll() {
   cancelId++;           // 让正在进行的流程检测到变化后自行终止
   running = false;
   clearTimeout(delayTimer);
-  try { window._activeAudio && window._activeAudio.pause(); } catch(e) {}
-  try { window.speechSynthesis && speechSynthesis.cancel(); } catch(e) {}
+  try { speechSynthesis.cancel(); } catch(e) {}
 }
 
 // ==========================================
@@ -730,16 +683,6 @@ el('startBtn').addEventListener('click', function() {
   }
 
   if (el('shuffleCheck').checked) items = shuffleArr(items);
-
-  // 解锁音频播放（有些浏览器需要在用户点击时先播放一个静音音频）
-  try {
-    var unlock = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=');
-    unlock.volume = 0;
-    unlock.play().catch(function(){});
-  } catch(e) {}
-
-  // 每轮听写重置语音模式，重新检测
-  useSysVoice = false;
 
   el('pauseBtn').textContent = '⏸ 暂停';
   el('checkBtn').style.display = 'none';
