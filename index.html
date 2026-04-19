@@ -371,7 +371,10 @@ function getPinyin(word) {
 }
 
 // ==========================================
-//  语音：在线标准发音（百度翻译 + 有道词典双源）
+//  语音：在线标准发音
+//  中文：百度翻译（清晰标准）→ 有道词典（备用）
+//  英文：有道词典 → 百度翻译（备用）
+//  极简实现：new Audio + play，不等canplay，不设playbackRate
 // ==========================================
 function getTtsUrls(text, lang) {
   var t = encodeURIComponent(text);
@@ -389,66 +392,43 @@ function getTtsUrls(text, lang) {
 }
 
 // 播放一段语音，返回 Promise
-// 依次尝试多个TTS源，第一个成功的就用
 function playAudio(text, lang, myId) {
   return new Promise(function(resolve) {
     if (myId !== cancelId) { resolve(); return; }
 
     var urls = getTtsUrls(text, lang);
-    var urlIdx = 0;
-    var resolved = false;
+    var ui = 0;
+    var finished = false;
 
     function done() {
-      if (!resolved) { resolved = true; resolve(); }
+      if (!finished) { finished = true; resolve(); }
     }
 
-    // 10秒总超时保护
-    var totalTimer = setTimeout(done, 10000);
+    // 总超时保护：10秒
+    setTimeout(done, 10000);
 
-    function tryUrl() {
-      if (resolved || myId !== cancelId || urlIdx >= urls.length) {
-        clearTimeout(totalTimer);
-        done();
-        return;
-      }
+    function tryNext() {
+      if (finished || myId !== cancelId) { done(); return; }
+      if (ui >= urls.length) { done(); return; }
 
-      var audio = new Audio();
+      var a = new Audio(urls[ui]);
       var failed = false;
-      window._activeAudio = audio;
+      window._activeAudio = a;
 
-      function fail() {
-        if (!failed && !resolved) {
-          failed = true;
-          try { audio.pause(); audio.src = ''; } catch(e) {}
-          urlIdx++;
-          tryUrl();
-        }
+      a.onended = done;
+      a.onerror = function() {
+        if (!failed) { failed = true; ui++; tryNext(); }
+      };
+
+      var p = a.play();
+      if (p && p.catch) {
+        p.catch(function() {
+          if (!failed) { failed = true; ui++; tryNext(); }
+        });
       }
-
-      audio.addEventListener('ended', function() {
-        clearTimeout(totalTimer);
-        clearTimeout(urlTimer);
-        done();
-      });
-
-      audio.addEventListener('error', fail);
-
-      // 单个URL 5秒超时
-      var urlTimer = setTimeout(fail, 5000);
-
-      audio.src = urls[urlIdx];
-      audio.load();
-
-      // 等音频准备好再播放
-      audio.addEventListener('canplay', function() {
-        if (resolved || myId !== cancelId) { done(); return; }
-        clearTimeout(urlTimer);
-        var p = audio.play();
-        if (p && p.catch) p.catch(fail);
-      });
     }
 
-    tryUrl();
+    tryNext();
   });
 }
 
@@ -456,17 +436,18 @@ function playAudio(text, lang, myId) {
 function quickSpeak(text, lang) {
   try { if (window._peekAudio) window._peekAudio.pause(); } catch(e) {}
   var urls = getTtsUrls(text, lang);
-  var idx = 0;
-  function tryOne() {
-    if (idx >= urls.length) return;
-    var a = new Audio(urls[idx]);
-    window._peekAudio = a;
-    var p = a.play();
-    if (p && p.catch) {
-      p.catch(function() { idx++; tryOne(); });
-    }
+  var a = new Audio(urls[0]);
+  window._peekAudio = a;
+  var p = a.play();
+  if (p && p.catch) {
+    p.catch(function() {
+      if (urls.length > 1) {
+        a = new Audio(urls[1]);
+        window._peekAudio = a;
+        a.play();
+      }
+    });
   }
-  tryOne();
 }
 
 // ==========================================
