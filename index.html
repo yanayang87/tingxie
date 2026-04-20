@@ -377,12 +377,10 @@ function getPinyin(word) {
 // ==========================================
 var zhVoice = null;
 var enVoice = null;
-var ttsUnlocked = false;  // iOS 需要在用户手势中先 speak 一次空内容来解锁
 
 function initVoices() {
   if (!window.speechSynthesis) return;
   var voices = speechSynthesis.getVoices();
-  if (!voices || voices.length === 0) return;  // 还没加载完，等 onvoiceschanged
   var zhList = [], enList = [];
 
   for (var i = 0; i < voices.length; i++) {
@@ -411,148 +409,44 @@ if (window.speechSynthesis) {
   initVoices();
 }
 
-// iOS/Safari 解锁：必须在用户点击事件中同步调用一次 speak
-// 之后 async 流程中的 speak 才会有声音
-// 返回 Promise，确保解锁完成后再播放真实内容
-function unlockTTS() {
-  if (ttsUnlocked) return Promise.resolve();
-  if (!window.speechSynthesis) return Promise.resolve();
-  ttsUnlocked = true;
-  return new Promise(function(resolve) {
-    var u = new SpeechSynthesisUtterance(' ');
-    u.volume = 0;
-    u.rate = 10;  // 尽快结束
-    u.onend = function() {
-      // 解锁完成后，清理队列，确保干净状态
-      try { speechSynthesis.cancel(); } catch(e) {}
-      resolve();
-    };
-    u.onerror = function() {
-      try { speechSynthesis.cancel(); } catch(e) {}
-      resolve();
-    };
-    // 安全超时：万一 onend 不触发
-    setTimeout(function() {
-      try { speechSynthesis.cancel(); } catch(e) {}
-      resolve();
-    }, 500);
-    speechSynthesis.speak(u);
-  });
-}
-
-// Chrome 长时间播放会让 speechSynthesis 进入假死状态
-// 需要周期性 pause/resume 来保活
-var keepAliveTimer = null;
-function startKeepAlive() {
-  stopKeepAlive();
-  keepAliveTimer = setInterval(function() {
-    if (window.speechSynthesis && speechSynthesis.speaking) {
-      speechSynthesis.pause();
-      speechSynthesis.resume();
-    }
-  }, 5000);
-}
-function stopKeepAlive() {
-  if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
-}
-
 // 播放一段语音，返回 Promise
 function playAudio(text, lang, myId) {
   return new Promise(function(resolve) {
     if (myId !== cancelId) { resolve(); return; }
     if (!window.speechSynthesis) { resolve(); return; }
 
-    // 每次播放前重新检查 voice（防止异步加载还没完成时 voice 为 null）
-    if (!zhVoice && !enVoice) initVoices();
+    speechSynthesis.cancel();
 
-    // 只在确实有东西在播/排队时才 cancel，避免无谓的 cancel 干扰后续 speak
-    var needCancel = speechSynthesis.speaking || speechSynthesis.pending;
+    var u = new SpeechSynthesisUtterance(text);
+    u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
+    u.rate = 0.8;
+    u.volume = 1;
 
-    function doSpeak() {
-      if (myId !== cancelId) { resolve(); return; }
+    var voice = (lang === 'zh') ? zhVoice : enVoice;
+    if (voice) u.voice = voice;
 
-      var u = new SpeechSynthesisUtterance(text);
-      u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
-      u.rate = 0.8;
-      u.volume = 1;
+    var done = false;
+    function finish() { if (!done) { done = true; resolve(); } }
 
-      var voice = (lang === 'zh') ? zhVoice : enVoice;
-      if (voice) u.voice = voice;
+    u.onend = finish;
+    u.onerror = finish;
+    setTimeout(finish, 8000);
 
-      var done = false;
-      function finish() {
-        if (!done) {
-          done = true;
-          resolve();
-        }
-      }
-
-      u.onend = finish;
-      u.onerror = function() { finish(); };
-      // 安全超时：避免 onend 不触发导致流程卡死
-      setTimeout(function() {
-        if (!done) {
-          try { speechSynthesis.cancel(); } catch(e) {}
-          finish();
-        }
-      }, 8000);
-
-      speechSynthesis.speak(u);
-
-      // 静默失败检测：等 500ms（给 TTS 引擎充足启动时间），
-      // 如果确实没开始播放，才重试一次
-      setTimeout(function() {
-        if (!done && !speechSynthesis.speaking && !speechSynthesis.pending) {
-          // 重试：先 cancel 清理，短暂等待后再 speak
-          try { speechSynthesis.cancel(); } catch(e) {}
-          setTimeout(function() {
-            if (!done && myId === cancelId) {
-              var u2 = new SpeechSynthesisUtterance(text);
-              u2.lang = u.lang;
-              u2.rate = u.rate;
-              u2.volume = u.volume;
-              if (voice) u2.voice = voice;
-              u2.onend = finish;
-              u2.onerror = function() { finish(); };
-              speechSynthesis.speak(u2);
-            }
-          }, 100);
-        }
-      }, 500);
-    }
-
-    if (needCancel) {
-      speechSynthesis.cancel();
-      // cancel 后等一小段让引擎清理完毕
-      setTimeout(doSpeak, 60);
-    } else {
-      // 队列干净，直接 speak，不加任何延迟
-      doSpeak();
-    }
+    speechSynthesis.speak(u);
   });
 }
 
 // 快速播放（看一看按钮用）
 function quickSpeak(text, lang) {
   if (!window.speechSynthesis) return;
-  if (!zhVoice && !enVoice) initVoices();
-  // 只在确实有东西在播放时才 cancel
-  var wasBusy = speechSynthesis.speaking || speechSynthesis.pending;
-  if (wasBusy) {
-    speechSynthesis.cancel();
-  }
+  speechSynthesis.cancel();
   var u = new SpeechSynthesisUtterance(text);
   u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
   u.rate = 0.8;
   u.volume = 1;
   var voice = (lang === 'zh') ? zhVoice : enVoice;
   if (voice) u.voice = voice;
-  if (wasBusy) {
-    // 刚 cancel 过，短暂延迟让引擎清理完毕
-    setTimeout(function() { speechSynthesis.speak(u); }, 60);
-  } else {
-    speechSynthesis.speak(u);
-  }
+  speechSynthesis.speak(u);
 }
 
 // ==========================================
@@ -571,10 +465,7 @@ function stopAll() {
   cancelId++;           // 让正在进行的流程检测到变化后自行终止
   running = false;
   clearTimeout(delayTimer);
-  stopKeepAlive();
-  if (window.speechSynthesis && (speechSynthesis.speaking || speechSynthesis.pending)) {
-    try { speechSynthesis.cancel(); } catch(e) {}
-  }
+  try { speechSynthesis.cancel(); } catch(e) {}
 }
 
 // ==========================================
@@ -698,7 +589,6 @@ async function runFrom(startIdx) {
   running = true;
   paused = false;
   idx = startIdx;
-  startKeepAlive();  // Chrome 保活定时器
 
   for (var i = startIdx; i < items.length; i++) {
     // 每一步都检查是否被取消
@@ -732,7 +622,6 @@ async function runFrom(startIdx) {
       el('statusText').textContent = '🎉 全部听写完成！';
       el('checkBtn').style.display = '';
       running = false;
-      stopKeepAlive();
       return;
     }
 
@@ -747,7 +636,6 @@ async function runFrom(startIdx) {
   }
 
   running = false;
-  stopKeepAlive();
 }
 
 // ==========================================
@@ -782,13 +670,9 @@ el('intervalSlider').addEventListener('input', function() {
 // ==========================================
 //  开始听写
 // ==========================================
-el('startBtn').addEventListener('click', async function() {
+el('startBtn').addEventListener('click', function() {
   var raw = el('wordsInput').value.trim();
   if (!raw) { alert('请先粘贴要听写的内容哦！'); return; }
-
-  // iOS Safari 要求第一次 speak 必须在用户手势中同步调用
-  // await 确保解锁完成后再播放真实内容，不会吞掉第一个词
-  await unlockTTS();
 
   items = buildItems(raw);
   if (items.length === 0) {
@@ -811,10 +695,9 @@ el('startBtn').addEventListener('click', async function() {
 // ==========================================
 //  暂停 / 继续
 // ==========================================
-el('pauseBtn').addEventListener('click', async function() {
+el('pauseBtn').addEventListener('click', function() {
   if (paused) {
     // 继续
-    await unlockTTS();
     paused = false;
     el('pauseBtn').textContent = '⏸ 暂停';
     runFrom(idx);
@@ -831,9 +714,8 @@ el('pauseBtn').addEventListener('click', async function() {
 // ==========================================
 //  上一个 / 下一个
 // ==========================================
-el('prevBtn').addEventListener('click', async function() {
+el('prevBtn').addEventListener('click', function() {
   if (idx > 0) {
-    await unlockTTS();
     stopAll();
     paused = false;
     el('pauseBtn').textContent = '⏸ 暂停';
@@ -841,9 +723,8 @@ el('prevBtn').addEventListener('click', async function() {
   }
 });
 
-el('nextBtn').addEventListener('click', async function() {
+el('nextBtn').addEventListener('click', function() {
   if (idx < items.length - 1) {
-    await unlockTTS();
     stopAll();
     paused = false;
     el('pauseBtn').textContent = '⏸ 暂停';
@@ -854,8 +735,7 @@ el('nextBtn').addEventListener('click', async function() {
 // ==========================================
 //  重新开始
 // ==========================================
-el('restartBtn').addEventListener('click', async function() {
-  await unlockTTS();
+el('restartBtn').addEventListener('click', function() {
   stopAll();
   el('pauseBtn').textContent = '⏸ 暂停';
   el('checkBtn').style.display = 'none';
@@ -973,8 +853,7 @@ el('showAllBtn').addEventListener('click', function() {
 // ==========================================
 //  错题重练
 // ==========================================
-el('wrongRedoBtn').addEventListener('click', async function() {
-  await unlockTTS();
+el('wrongRedoBtn').addEventListener('click', function() {
   var redo = [];
   var keys = Object.keys(wrongSet);
   for (var k = 0; k < keys.length; k++) {
