@@ -324,18 +324,21 @@ h1 { text-align: center; font-size: 26px; color: #333; margin-bottom: 6px; }
   </div>
 </div>
 
+<!-- ★ 关键：固定在页面里的音频元素，不会被反复新建/销毁 -->
+<audio id="speaker" preload="auto"></audio>
+
 <script>
 // ==========================================
 //  状态
 // ==========================================
-var mode = 'zh';         // zh | en | zh2en
-var items = [];          // {readText, readLang, hint, answer, answerSub}
-var idx = 0;             // 当前索引
-var running = false;     // 是否正在自动播放流程中
-var paused = false;      // 是否暂停
-var cancelId = 0;        // 用于取消：stopAll 时递增，流程中检查是否变了就中止
+var mode = 'zh';
+var items = [];
+var idx = 0;
+var running = false;
+var paused = false;
+var cancelId = 0;
 var delayTimer = null;
-var wrongSet = {};       // 错题索引集合 { 0: true, 3: true, ... }
+var wrongSet = {};
 
 // ==========================================
 //  工具
@@ -371,30 +374,34 @@ function getPinyin(word) {
 }
 
 // ==========================================
-//  语音系统：纯系统语音（最稳定）
-//  严格只用 zh-CN 普通话，排除一切粤语/台语
-//  不走网络，不会时好时坏
+//  语音系统（重写核心）
+//
+//  关键设计：
+//  1. 页面里放一个固定的 <audio id="speaker">，始终复用
+//  2. 用户点"开始听写"时，先用这个元素播一个静音，
+//     让手机浏览器"认可"这个元素有播放权限
+//  3. 之后每个词只换 src 再 play，不新建元素
+//  4. 在线发音(有道)优先，失败了用系统语音兜底
+//  5. 一旦确定用系统语音，整轮听写不再切换
 // ==========================================
+var speaker = null;       // 主音频元素（DOM里的那个）
+var audioUnlocked = false; // 是否已解锁音频权限
+var useSysVoice = false;  // 是否已切换到系统语音
 var zhVoice = null;
 var enVoice = null;
 
+// 查找最佳系统语音
 function initVoices() {
   if (!window.speechSynthesis) return;
   var voices = speechSynthesis.getVoices();
   var zhList = [], enList = [];
-
   for (var i = 0; i < voices.length; i++) {
     var v = voices[i];
     var lang = v.lang.replace('_', '-');
-    // 只要 zh-CN，排除一切粤语台语
-    if (lang === 'zh-CN' && !/Cantonese|HK|TW|粤|廣|台/i.test(v.name)) {
-      zhList.push(v);
-    }
+    if (lang === 'zh-CN' && !/Cantonese|HK|TW|粤|廣|台/i.test(v.name)) zhList.push(v);
     if (lang === 'en-US') enList.push(v);
     if (lang === 'en-GB' && enList.length === 0) enList.push(v);
   }
-
-  // 优先微软/Google高品质语音
   zhVoice = zhList[0] || null;
   for (var i = 0; i < zhList.length; i++) {
     if (/Microsoft|Google|Huihui|Xiaoxiao|Kangkang/i.test(zhList[i].name)) { zhVoice = zhList[i]; break; }
@@ -409,44 +416,136 @@ if (window.speechSynthesis) {
   initVoices();
 }
 
-// 播放一段语音，返回 Promise
-function playAudio(text, lang, myId) {
+// 有道词典在线发音地址
+function ttsUrl(text, lang) {
+  return 'https://dict.youdao.com/dictvoice?audio=' + encodeURIComponent(text) + '&le=' + (lang === 'zh' ? 'zh' : 'en');
+}
+
+// 解锁音频（在用户点击时调用）
+function unlockAudio() {
+  if (audioUnlocked) return Promise.resolve();
+  speaker = el('speaker');
+  // 播放一个极短的静音来获取播放权限
+  speaker.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+  speaker.volume = 0.01;
+  return speaker.play().then(function() {
+    speaker.pause();
+    speaker.volume = 1;
+    audioUnlocked = true;
+  }).catch(function() {
+    speaker.volume = 1;
+    audioUnlocked = true; // 即使失败也标记为已尝试
+  });
+}
+
+// 用固定元素播放在线音频
+function playOnline(text, lang) {
   return new Promise(function(resolve) {
-    if (myId !== cancelId) { resolve(); return; }
+    var done = false;
+    function finish(success) {
+      if (!done) { done = true; resolve(success); }
+    }
+
+    // 超时保护
+    var timer = setTimeout(function() { finish(false); }, 6000);
+
+    function onEnded() {
+      clearTimeout(timer);
+      speaker.removeEventListener('ended', onEnded);
+      speaker.removeEventListener('error', onError);
+      finish(true);
+    }
+    function onError() {
+      clearTimeout(timer);
+      speaker.removeEventListener('ended', onEnded);
+      speaker.removeEventListener('error', onError);
+      finish(false);
+    }
+
+    speaker.addEventListener('ended', onEnded);
+    speaker.addEventListener('error', onError);
+
+    speaker.src = ttsUrl(text, lang);
+    var p = speaker.play();
+    if (p && p.catch) p.catch(function() { onError(); });
+  });
+}
+
+// 系统语音播放
+function playSys(text, lang) {
+  return new Promise(function(resolve) {
     if (!window.speechSynthesis) { resolve(); return; }
-
     speechSynthesis.cancel();
-
     var u = new SpeechSynthesisUtterance(text);
     u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
     u.rate = 0.8;
     u.volume = 1;
-
     var voice = (lang === 'zh') ? zhVoice : enVoice;
     if (voice) u.voice = voice;
-
     var done = false;
     function finish() { if (!done) { done = true; resolve(); } }
-
     u.onend = finish;
     u.onerror = finish;
     setTimeout(finish, 8000);
-
     speechSynthesis.speak(u);
   });
 }
 
-// 快速播放（看一看按钮用）
+// ★ 主播放函数
+function playAudio(text, lang, myId) {
+  return new Promise(function(resolve) {
+    if (myId !== cancelId) { resolve(); return; }
+
+    // 已确定用系统语音
+    if (useSysVoice) {
+      playSys(text, lang).then(resolve);
+      return;
+    }
+
+    // 尝试在线
+    playOnline(text, lang).then(function(success) {
+      if (myId !== cancelId) { resolve(); return; }
+      if (success) {
+        resolve();
+      } else {
+        // 在线失败 → 本轮切换系统语音，不再交替
+        useSysVoice = true;
+        playSys(text, lang).then(resolve);
+      }
+    });
+  });
+}
+
+// 快速播放（看一看按钮，用户直接点击，有手势权限）
 function quickSpeak(text, lang) {
-  if (!window.speechSynthesis) return;
-  speechSynthesis.cancel();
-  var u = new SpeechSynthesisUtterance(text);
-  u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
-  u.rate = 0.8;
-  u.volume = 1;
-  var voice = (lang === 'zh') ? zhVoice : enVoice;
-  if (voice) u.voice = voice;
-  speechSynthesis.speak(u);
+  // 优先用在线（此时是用户点击，有权限）
+  if (!useSysVoice) {
+    var a = new Audio(ttsUrl(text, lang));
+    a.play().catch(function() {
+      // 失败就用系统语音
+      if (window.speechSynthesis) {
+        speechSynthesis.cancel();
+        var u = new SpeechSynthesisUtterance(text);
+        u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
+        u.rate = 0.8;
+        var voice = (lang === 'zh') ? zhVoice : enVoice;
+        if (voice) u.voice = voice;
+        speechSynthesis.speak(u);
+      }
+    });
+    return;
+  }
+
+  // 系统语音
+  if (window.speechSynthesis) {
+    speechSynthesis.cancel();
+    var u = new SpeechSynthesisUtterance(text);
+    u.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
+    u.rate = 0.8;
+    var voice = (lang === 'zh') ? zhVoice : enVoice;
+    if (voice) u.voice = voice;
+    speechSynthesis.speak(u);
+  }
 }
 
 // ==========================================
@@ -462,9 +561,10 @@ function delay(ms) {
 //  停止一切
 // ==========================================
 function stopAll() {
-  cancelId++;           // 让正在进行的流程检测到变化后自行终止
+  cancelId++;
   running = false;
   clearTimeout(delayTimer);
+  try { speaker && speaker.pause(); } catch(e) {}
   try { speechSynthesis.cancel(); } catch(e) {}
 }
 
@@ -489,13 +589,10 @@ function parsePairs(text) {
     var line = lines[li].trim();
     if (!line) continue;
 
-    // 把分隔符规范化
     var norm = line.replace(/[-:：=]/g, ' ');
     var tokens = norm.split(/\s+/).filter(function(t) { return t; });
-
     if (tokens.length === 0) continue;
 
-    // 分类每个token
     var groups = [];
     for (var ti = 0; ti < tokens.length; ti++) {
       var tk = tokens[ti];
@@ -505,14 +602,12 @@ function parsePairs(text) {
       groups.push({ t: tk, type: type });
     }
 
-    // 组合成对
     var gi = 0;
     while (gi < groups.length) {
       var cur = groups[gi];
       var nxt = gi + 1 < groups.length ? groups[gi + 1] : null;
 
       if (cur.type === 'mix') {
-        // 混合token：直接拆出中英文
         var cn = (cur.t.match(/[\u4e00-\u9fff\u3400-\u4dbf]+/g) || []).join('');
         var en = (cur.t.match(/[a-zA-Z][a-zA-Z'\-]*/g) || []).join(' ');
         if (cn && en) result.push({ cn: cn, en: en });
@@ -524,7 +619,7 @@ function parsePairs(text) {
         result.push({ cn: nxt.t, en: cur.t });
         gi += 2;
       } else {
-        gi++; // 跳过无法配对的
+        gi++;
       }
     }
   }
@@ -585,13 +680,12 @@ function showHint(item) {
 //  核心：自动播放流程
 // ==========================================
 async function runFrom(startIdx) {
-  var myId = cancelId;  // 记住当前版本号
+  var myId = cancelId;
   running = true;
   paused = false;
   idx = startIdx;
 
   for (var i = startIdx; i < items.length; i++) {
-    // 每一步都检查是否被取消
     if (myId !== cancelId) return;
 
     idx = i;
@@ -606,9 +700,9 @@ async function runFrom(startIdx) {
     if (myId !== cancelId) return;
     el('statusText').classList.remove('speaking');
 
-    // ---- 停顿 ----
+    // ---- 两遍之间停顿 ----
     el('statusText').textContent = '🔊 再读一遍...';
-    await delay(1800);
+    await delay(2000);
     if (myId !== cancelId) return;
 
     // ---- 第二遍 ----
@@ -668,7 +762,7 @@ el('intervalSlider').addEventListener('input', function() {
 });
 
 // ==========================================
-//  开始听写
+//  开始听写（★ 在用户点击时解锁音频）
 // ==========================================
 el('startBtn').addEventListener('click', function() {
   var raw = el('wordsInput').value.trim();
@@ -684,12 +778,19 @@ el('startBtn').addEventListener('click', function() {
 
   if (el('shuffleCheck').checked) items = shuffleArr(items);
 
+  // 每轮重置
+  useSysVoice = false;
+
   el('pauseBtn').textContent = '⏸ 暂停';
   el('checkBtn').style.display = 'none';
   paused = false;
 
   showPage('pagePlayer');
-  runFrom(0);
+
+  // ★ 先解锁音频，再开始播放
+  unlockAudio().then(function() {
+    runFrom(0);
+  });
 });
 
 // ==========================================
@@ -697,12 +798,10 @@ el('startBtn').addEventListener('click', function() {
 // ==========================================
 el('pauseBtn').addEventListener('click', function() {
   if (paused) {
-    // 继续
     paused = false;
     el('pauseBtn').textContent = '⏸ 暂停';
     runFrom(idx);
   } else {
-    // 暂停
     stopAll();
     paused = true;
     el('pauseBtn').textContent = '▶️ 继续';
@@ -752,7 +851,7 @@ el('backToInputBtn').addEventListener('click', function() {
 });
 
 // ==========================================
-//  看一看（中报英写/英文模式同时朗读英文）
+//  看一看
 // ==========================================
 el('peekBtn').addEventListener('click', function() {
   var rv = el('answerReveal');
@@ -760,7 +859,6 @@ el('peekBtn').addEventListener('click', function() {
     rv.textContent = items[idx].answer;
     rv.style.display = '';
     el('peekBtn').textContent = '🙈 藏起来';
-    // 英文相关模式：朗读英文
     if (mode === 'zh2en' || mode === 'en') {
       quickSpeak(items[idx].answer, 'en');
     }
@@ -840,7 +938,6 @@ function refreshWrongUI() {
   el('wrongRedoBtn').className = count > 0 ? 'btn-wrong-redo show' : 'btn-wrong-redo';
 }
 
-// 全部显示
 el('showAllBtn').addEventListener('click', function() {
   var cards = el('answerList').children;
   for (var i = 0; i < cards.length; i++) {
@@ -863,15 +960,17 @@ el('wrongRedoBtn').addEventListener('click', function() {
 
   items = el('shuffleCheck').checked ? shuffleArr(redo) : redo;
   wrongSet = {};
+  useSysVoice = false;
   paused = false;
   el('pauseBtn').textContent = '⏸ 暂停';
   el('checkBtn').style.display = 'none';
 
   showPage('pagePlayer');
-  runFrom(0);
+  unlockAudio().then(function() {
+    runFrom(0);
+  });
 });
 
-// 返回听写 / 再来一轮
 el('backToPlayerBtn').addEventListener('click', function() {
   showPage('pagePlayer');
   el('checkBtn').style.display = '';
@@ -897,7 +996,6 @@ function loadDraft() {
 
 el('wordsInput').addEventListener('input', saveDraft);
 
-// 保存设置
 function saveSettings() {
   try {
     localStorage.setItem('dictation_interval', el('intervalSlider').value);
@@ -918,9 +1016,7 @@ el('intervalSlider').addEventListener('change', saveSettings);
 el('shuffleCheck').addEventListener('change', saveSettings);
 loadSettings();
 
-// 选模式时恢复上次输入
-var origModeClick = document.querySelectorAll('.mode-btn');
-origModeClick.forEach(function(btn) {
+document.querySelectorAll('.mode-btn').forEach(function(btn) {
   btn.addEventListener('click', function() {
     loadDraft();
     renderBankList();
@@ -940,7 +1036,6 @@ function saveBanks(banks) {
 
 function renderBankList() {
   var banks = getBanks();
-  // 只显示当前模式的词库
   var filtered = banks.filter(function(b) { return b.mode === mode; });
   var list = el('bankList');
 
@@ -951,7 +1046,6 @@ function renderBankList() {
 
   list.innerHTML = '';
   filtered.forEach(function(bank, fi) {
-    // 找到在总数组中的真实索引
     var realIdx = banks.indexOf(bank);
 
     var item = document.createElement('div');
@@ -974,14 +1068,12 @@ function renderBankList() {
     item.appendChild(countSpan);
     item.appendChild(delBtn);
 
-    // 点击加载词库
     item.addEventListener('click', function(e) {
       if (e.target === delBtn) return;
       el('wordsInput').value = bank.content;
       saveDraft();
     });
 
-    // 删除
     delBtn.addEventListener('click', function(e) {
       e.stopPropagation();
       if (confirm('删除词库"' + bank.name + '"？')) {
@@ -996,7 +1088,6 @@ function renderBankList() {
   });
 }
 
-// 保存词库弹窗
 el('saveBankBtn').addEventListener('click', function() {
   var content = el('wordsInput').value.trim();
   if (!content) { alert('输入框是空的，请先粘贴词语～'); return; }
