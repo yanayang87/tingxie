@@ -385,7 +385,6 @@ function getPinyin(word) {
 //  5. 一旦确定用系统语音，整轮听写不再切换
 // ==========================================
 var speaker = null;       // 主音频元素（DOM里的那个）
-var audioUnlocked = false; // 是否已解锁音频权限
 var useSysVoice = false;  // 是否已切换到系统语音
 var zhVoice = null;
 var enVoice = null;
@@ -419,23 +418,6 @@ if (window.speechSynthesis) {
 // 有道词典在线发音地址
 function ttsUrl(text, lang) {
   return 'https://dict.youdao.com/dictvoice?audio=' + encodeURIComponent(text) + '&le=' + (lang === 'zh' ? 'zh' : 'en');
-}
-
-// 解锁音频（在用户点击时调用）
-function unlockAudio() {
-  if (audioUnlocked) return Promise.resolve();
-  speaker = el('speaker');
-  // 播放一个极短的静音来获取播放权限
-  speaker.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
-  speaker.volume = 0.01;
-  return speaker.play().then(function() {
-    speaker.pause();
-    speaker.volume = 1;
-    audioUnlocked = true;
-  }).catch(function() {
-    speaker.volume = 1;
-    audioUnlocked = true; // 即使失败也标记为已尝试
-  });
 }
 
 // 用固定元素播放在线音频
@@ -787,10 +769,9 @@ el('startBtn').addEventListener('click', function() {
 
   showPage('pagePlayer');
 
-  // ★ 先解锁音频，再开始播放
-  unlockAudio().then(function() {
-    runFrom(0);
-  });
+  // 初始化音频元素并直接开始
+  speaker = el('speaker');
+  runFrom(0);
 });
 
 // ==========================================
@@ -966,9 +947,8 @@ el('wrongRedoBtn').addEventListener('click', function() {
   el('checkBtn').style.display = 'none';
 
   showPage('pagePlayer');
-  unlockAudio().then(function() {
-    runFrom(0);
-  });
+  speaker = el('speaker');
+  runFrom(0);
 });
 
 el('backToPlayerBtn').addEventListener('click', function() {
